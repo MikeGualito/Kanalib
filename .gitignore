@@ -1,0 +1,58 @@
+# --- Python bytecode -------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Packaging / editable installs -----------------------------------------
+# `pip install -e KanalibLin` and `-e KanalibCan` drop these next to each
+# pyproject.toml; they are build state, not source.
+build/
+dist/
+*.egg-info/
+*.egg-link
+.eggs/
+pip-wheel-metadata/
+
+# --- Virtual environments --------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# --- Test / type-check / coverage caches -----------------------------------
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Editors and IDEs ------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Windows ---------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- Bus captures and local run output -------------------------------------
+# Logs produced by the examples and by the CSV recipe in the LIN README.
+# Deliberately narrow: a *.csv rule would swallow legitimate test vectors.
+bus.csv
+*.log
+capture_*.csv
+capture_*.asc
+capture_*.blf
+*.pcapng
+
+# --- Local scratch ---------------------------------------------------------
+scratch/
+tmp/
+*.local.py

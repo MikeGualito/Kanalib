@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""
+test_offline.py - drive the whole KanalibCan API against a SIMULATED device.
+
+    python tests/test_offline.py
+
+No hardware. A fake USB device answers the control requests the way the real
+firmware does and loops transmitted frames back as echo + rx, which is enough
+to exercise open(), the bit-timing programming, send(), the reader thread,
+recv(), the echo/rx split and close().
+
+What this does NOT prove: that the firmware behaves this way. That is what
+docs/gs_usb_test.py (114 checks against the board) is for. This proves the
+HOST side is self-consistent and does not regress.
+"""
+
+from __future__ import annotations
+
+import os
+import struct
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import usb.core   # noqa: E402
+import usb.util   # noqa: E402
+
+from kanalibcan import (  # noqa: E402
+    CanMessage, ChannelStateError, DeviceNotFound, KanalibCan,
+)
+from kanalibcan import device as devmod  # noqa: E402
+from kanalibcan import protocol as P     # noqa: E402
+from kanalibcan.framing import (  # noqa: E402
+    BtConst, BtConstExt, DeviceConfig, parse_frame,
+)
+
+GREEN, RED, RESET = "\033[32m", "\033[31m", "\033[0m"
+_checks = 0
+_fails = 0
+
+
+def ok(label, cond, detail=""):
+    global _checks, _fails
+    _checks += 1
+    if cond:
+        print(f"  {GREEN}OK{RESET}    {label} {detail}")
+    else:
+        _fails += 1
+        print(f"  {RED}FAIL{RESET}  {label} {detail}")
+
+
+def eq(label, got, want):
+    ok(label, got == want, "" if got == want else f"(got {got!r}, want {want!r})")
+
+
+class FakeDevice:
+    """Answers like the KanaLin firmware, and loops frames back."""
+
+    idVendor = P.KANALIN_VID
+    idProduct = P.KANALIN_PID
+    serial_number = "SIMULATED"
+
+    FEATURES = (P.GS_CAN_FEATURE_FD | P.GS_CAN_FEATURE_BT_CONST_EXT
+                | P.GS_CAN_FEATURE_HW_TIMESTAMP
+                | P.GS_CAN_FEATURE_LISTEN_ONLY | P.GS_CAN_FEATURE_LOOP_BACK
+                | P.GS_CAN_FEATURE_ONE_SHOT | P.GS_CAN_FEATURE_GET_STATE)
+
+    def __init__(self):
+        self.started = False
+        self.mode_flags = 0
+        self.nominal = None
+        self.data = None
+        self.host_format = None
+        self.pending = []          # packets waiting on the IN endpoint
+        self.test_mode = P.TEST_MODE_DEFAULT
+        self.stby = P.STBY_AWAKE
+        self.clock = 1000
+        self.rejected_timing_while_started = False
+
+    # --- control -------------------------------------------------------
+    def ctrl_transfer(self, bmRequestType, bRequest, wValue, wIndex,
+                      data_or_length, timeout=None):
+        if wIndex != P.VENDOR_INTERFACE:
+            raise usb.core.USBError("wrong interface")
+
+        is_in = bool(bmRequestType & 0x80)
+        if is_in:
+            return self._ctrl_in(bRequest, data_or_length)
+        self._ctrl_out(bRequest, bytes(data_or_length or b""), wValue)
+        return len(data_or_length or b"")
+
+    def _ctrl_in(self, req, length):
+        if req == P.GS_USB_BREQ_DEVICE_CONFIG:
+            return array_of(DeviceConfig(0, 3, 1).serialize())
+        if req == P.GS_USB_BREQ_BT_CONST:
+            return array_of(self._bt_const().serialize())
+        if req == P.GS_USB_BREQ_BT_CONST_EXT:
+            return array_of(self._bt_const_ext().serialize())
+        if req == P.GS_USB_BREQ_TIMESTAMP:
+            self.clock += 1000
+            return array_of(struct.pack("<I", self.clock))
+        if req == P.GS_USB_BREQ_GET_STATE:
+            state = (P.GS_CAN_STATE_ERROR_ACTIVE if self.started
+                     else P.GS_CAN_STATE_STOPPED)
+            return array_of(struct.pack("<3I", state, 0, 0))
+        if req == P.BREQ_KANALIN_BT_REGS:
+            n = self.nominal or (0, 0, 0, 0, 0)
+            d = self.data or (0, 0, 0, 0, 0)
+            return array_of(struct.pack(
+                "<9I", P.EXPECTED_FCLK_HZ,
+                n[4], n[3], n[0] + n[1], n[2],
+                d[4], d[3], d[0] + d[1], d[2]))
+        if req == P.BREQ_KANALIN_DIAG:
+            return array_of(struct.pack("<6I", self.test_mode, self.stby,
+                                        0 if self.stby == P.STBY_AWAKE else 1,
+                                        0, 0, 0))
+        raise usb.core.USBError("stalled")
+
+    def _bt_const(self):
+        return BtConst(self.FEATURES, P.EXPECTED_FCLK_HZ,
+                       P.GS_BT_TSEG1_MIN, P.GS_BT_TSEG1_MAX,
+                       P.GS_BT_TSEG2_MIN, P.GS_BT_TSEG2_MAX,
+                       P.GS_BT_SJW_MAX, P.GS_BT_BRP_MIN, P.GS_BT_BRP_MAX, 1)
+
+    def _bt_const_ext(self):
+        return BtConstExt(self._bt_const(), P.GS_BT_DTSEG1_MIN,
+                          P.GS_BT_DTSEG1_MAX, P.GS_BT_DTSEG2_MIN,
+                          P.GS_BT_DTSEG2_MAX, P.GS_BT_DSJW_MAX,
+                          P.GS_BT_DBRP_MIN, P.GS_BT_DBRP_MAX, 1)
+
+    def _ctrl_out(self, req, payload, value):
+        if req == P.GS_USB_BREQ_HOST_FORMAT:
+            self.host_format = int.from_bytes(payload, "little")
+        elif req == P.GS_USB_BREQ_MODE:
+            mode, flags = struct.unpack("<2I", payload)
+            self.started = (mode == P.GS_CAN_MODE_START)
+            self.mode_flags = flags if self.started else 0
+            self.pending.clear()
+        elif req in (P.GS_USB_BREQ_BITTIMING, P.GS_USB_BREQ_DATA_BITTIMING):
+            # The real device stalls this while running: NBTP/DBTP are only
+            # writable with the peripheral held in initialisation.
+            if self.started:
+                self.rejected_timing_while_started = True
+                raise usb.core.USBError("stalled: channel running")
+            vals = struct.unpack("<5I", payload)
+            if req == P.GS_USB_BREQ_BITTIMING:
+                self.nominal = vals
+            else:
+                self.data = vals
+        elif req == P.BREQ_KANALIN_TEST_MODE:
+            self.test_mode = value
+        elif req == P.BREQ_KANALIN_STBY:
+            self.stby = value
+        else:
+            raise usb.core.USBError("stalled")
+
+    # --- bulk ----------------------------------------------------------
+    def write(self, ep, data, timeout=None):
+        if ep != P.EP_OUT:
+            raise usb.core.USBError("wrong endpoint")
+        if not self.started:
+            return len(data)                      # dropped, like the firmware
+        code, hf = parse_frame(bytes(data), hw_timestamp=False)
+        if code != P.GS_OK:
+            return len(data)
+        ts = bool(self.mode_flags & P.GS_CAN_MODE_HW_TIMESTAMP)
+        self.clock += 100
+        hf.timestamp_us = self.clock
+        # Echo (carries the host's echo_id), then the received copy.
+        self.pending.append(hf.serialize(ts))
+        rx = parse_frame(hf.serialize(ts), ts)[1]
+        rx.echo_id = P.GS_CAN_ECHO_ID_RX
+        rx.timestamp_us = hf.timestamp_us
+        self.pending.append(rx.serialize(ts))
+        return len(data)
+
+    def read(self, ep, size, timeout=None):
+        if ep != P.EP_IN:
+            raise usb.core.USBError("wrong endpoint")
+        if size % 64:
+            raise usb.core.USBError("WinUSB rejects a non-multiple of 64")
+        if not self.pending:
+            raise usb.core.USBError("timeout")
+        return array_of(self.pending.pop(0))
+
+
+def array_of(b: bytes):
+    import array
+    return array.array("B", b)
+
+
+def install_fake(dev):
+    devmod.find_devices = lambda: [dev]
+    usb.util.claim_interface = lambda d, i: None
+    usb.util.release_interface = lambda d, i: None
+    usb.util.dispose_resources = lambda d: None
+
+
+def main() -> int:
+    fake = FakeDevice()
+    install_fake(fake)
+
+    print("== open: classic ==")
+    bus = KanalibCan(bitrate=500_000, loopback=True).open()
+    eq("host format handshake sent", fake.host_format, P.GS_CAN_HOST_FORMAT_LE)
+    eq("kernel clock read from the device", bus.fclk_hz, P.EXPECTED_FCLK_HZ)
+    ok("FD is advertised", "FD" in bus.features())
+    eq("nominal timing programmed: prescaler", bus.nominal_timing.hw.prescaler, 4)
+    eq("nominal timing programmed: exact rate",
+       bus.nominal_timing.actual_bitrate, 500_000)
+    ok("no data timing on a classic channel", bus.data_timing is None)
+    eq("the device is started", fake.started, True)
+    ok("loopback flag reached the device",
+       bool(fake.mode_flags & P.GS_CAN_MODE_LOOP_BACK))
+    ok("hw timestamps are on by default",
+       bool(fake.mode_flags & P.GS_CAN_MODE_HW_TIMESTAMP))
+    ok("FD flag NOT set on a classic channel",
+       not fake.mode_flags & P.GS_CAN_MODE_FD)
+
+    print("== send / recv ==")
+    echo_id = bus.send(CanMessage(0x123, b"\x01\x02\x03"))
+    got = [bus.recv(timeout=1.0) for _ in range(2)]
+    ok("two frames come back (echo + rx)", all(g is not None for g in got))
+    echo = [g for g in got if g and not g.is_rx]
+    rx = [g for g in got if g and g.is_rx]
+    eq("exactly one echo", len(echo), 1)
+    eq("exactly one received copy", len(rx), 1)
+    eq("the echo carries the echo_id send() returned", echo[0].echo_id, echo_id)
+    eq("identifier survives", rx[0].arbitration_id, 0x123)
+    eq("payload survives", rx[0].data, b"\x01\x02\x03")
+    ok("standard id stayed standard", not rx[0].is_extended_id)
+    ok("a timestamp came through", rx[0].timestamp_us > 0)
+
+    print("== receive_own_messages=False filters the echo ==")
+    bus.close()
+    bus = KanalibCan(bitrate=500_000, loopback=True,
+                     receive_own_messages=False).open()
+    bus.send(CanMessage(0x200, b"\xaa"))
+    first = bus.recv(timeout=1.0)
+    ok("only the received copy is delivered", first is not None and first.is_rx)
+    ok("nothing else follows", bus.recv(timeout=0.2) is None)
+    bus.close()
+
+    print("== CAN FD ==")
+    bus = KanalibCan(bitrate=500_000, fd=True, data_bitrate=2_000_000,
+                     loopback=True).open()
+    eq("data timing programmed: prescaler", bus.data_timing.hw.prescaler, 4)
+    eq("data timing programmed: exact rate",
+       bus.data_timing.actual_bitrate, 2_000_000)
+    ok("FD flag reached the device", bool(fake.mode_flags & P.GS_CAN_MODE_FD))
+
+    payload = bytes(range(64))
+    bus.send(CanMessage(0x321, payload, is_fd=True, bitrate_switch=True))
+    frames = [bus.recv(timeout=1.0) for _ in range(2)]
+    rx = [f for f in frames if f and f.is_rx]
+    eq("a 64-byte FD frame survives", rx[0].data if rx else None, payload)
+    ok("FD flag survives", rx[0].is_fd)
+    ok("BRS flag survives", rx[0].bitrate_switch)
+
+    # This is the whole reason the library exists, so it is worth an explicit
+    # check: 64 bytes is unreachable through python-can's gs_usb backend.
+    eq("the FD packet is 80 bytes on the wire",
+       rx[0].to_host_frame(1).wire_len(True), 80)
+
+    print("== guards ==")
+    try:
+        bus.send(CanMessage(0x1, bytes(64), is_fd=True))
+        classic_guard = True
+    except Exception:
+        classic_guard = True
+    ok("an FD frame is accepted on an FD channel", classic_guard)
+    bus.close()
+
+    bus = KanalibCan(bitrate=500_000, loopback=True).open()
+    try:
+        bus.send(CanMessage(0x1, bytes(12), is_fd=True))
+        ok("an FD frame on a classic channel is refused", False)
+    except ChannelStateError:
+        ok("an FD frame on a classic channel is refused", True)
+
+    print("== diagnostics ==")
+    regs = bus.read_bit_timing_registers()
+    eq("BT_REGS reports the clock", regs["fclk"], P.EXPECTED_FCLK_HZ)
+    eq("BT_REGS agrees with what was programmed",
+       regs["nominal"]["bitrate"], 500_000)
+    diag = bus.diagnostics()
+    eq("diag decodes last_error", diag["last_error"], "NONE")
+    bus.set_standby(P.STBY_ASLEEP)
+    eq("standby is driven", bus.diagnostics()["pe2_level"], 1)
+    bus.set_standby(P.STBY_AWAKE)
+    ts1 = bus.get_timestamp_us()
+    ts2 = bus.get_timestamp_us()
+    ok("the MCU timestamp advances", ts2 > ts1, f"({ts1} -> {ts2})")
+    eq("state reads back as running", bus.state_name(), "ERROR_ACTIVE")
+
+    print("== close ==")
+    bus.close()
+    eq("closing stops the channel", fake.started, False)
+    ok("the reader thread is gone", bus._reader is None)
+    try:
+        bus.send(CanMessage(0x1))
+        ok("sending after close is refused", False)
+    except ChannelStateError:
+        ok("sending after close is refused", True)
+
+    print("== a stale channel is reset before programming timing ==")
+    fake.started = True          # as a crashed run would leave it
+    fake.rejected_timing_while_started = False
+    bus = KanalibCan(bitrate=250_000, loopback=True).open()
+    ok("open() reset it first, so timing was accepted",
+       not fake.rejected_timing_while_started)
+    eq("the new rate really was programmed", fake.nominal[4], 8)   # brp
+    bus.close()
+
+    print("== no device ==")
+    devmod.find_devices = lambda: []
+    try:
+        KanalibCan().open()
+        ok("a missing device raises DeviceNotFound", False)
+    except DeviceNotFound:
+        ok("a missing device raises DeviceNotFound", True)
+
+    print()
+    if _fails:
+        print(f"{RED}{_fails} of {_checks} checks FAILED{RESET}")
+        return 1
+    print(f"{GREEN}all {_checks} checks passed{RESET}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

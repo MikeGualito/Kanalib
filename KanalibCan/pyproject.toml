@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kanalibcan"
+version = "1.0.0"
+description = "Python API for the CAN / CAN FD channel of a KanaLin USB interface"
+readme = "README.md"
+requires-python = ">=3.9"
+# pyusb needs a libusb backend; on Windows it ships none, so libusb-package
+# carries the DLL. python-can is NOT a dependency: this library talks gs_usb
+# directly, which is what makes CAN FD reachable.
+dependencies = ["pyusb>=1.2", "libusb-package>=1.0"]
+# Conservative placeholder: no terms are granted until this is decided.
+license = { text = "Proprietary - all rights reserved" }
+
+[tool.setuptools.packages.find]
+include = ["kanalibcan*"]
+
+# Ships the PEP 561 marker so type checkers use the annotations in consumers.
+[tool.setuptools.package-data]
+kanalibcan = ["py.typed"]

@@ -66,6 +66,32 @@ py KanalibCan/examples/00_preflight.py
 
 ---
 
+## Choosing a board
+
+With one board attached, nothing is needed. With two, pass the USB serial —
+each board derives it from its MCU unique device ID, and it is the only stable
+identity they have:
+
+```python
+from kanalibcan import KanalibCan, list_devices
+from kanaliblin import KanaLin
+
+list_devices()                 # ['003200386528', '009600536528']
+KanaLin.list_devices()         # [('COM12', '00320...'), ('COM14', '00960...')]
+
+# The ORDER is whatever enumeration returned -- never index by position,
+# match on the serial.
+
+bus = KanalibCan(serial="003200386528")
+lin = KanaLin.open(serial_number="003200386528")
+```
+
+⚠️ A board reports its serial and answers on both channels **whether or not its
+LIN transceiver is fitted**. The USB side does not depend on it, so "the port is
+there" does not mean "the LIN hardware is there".
+
+---
+
 ## Quick start
 
 **LIN**
@@ -135,6 +161,15 @@ short version, because they are the failures that look like something else:
   purpose; a bus quietly running at the wrong rate is worse than an error.
 - **CAN — `is_extended_id` defaults to `False`**, unlike `python-can`, and an
   identifier that does not fit raises instead of being silently masked.
+- **CAN — a burst can outrun the bus, and `send()` will not tell you.** The
+  device queues what it can and counts the rest; check
+  `diagnostics()["tx_dropped"]` after any burst, or space the sends.
+- **CAN — `ERROR_PASSIVE` survives across runs** and `open()` does not clear it.
+  A run where nobody acknowledged leaves the node at `tx_err = 128`; check
+  `get_state()` when a session starts behaving oddly.
+- **Both — two boards are told apart ONLY by their USB serial.** They share
+  VID/PID and their COM numbers move between plug-ins. `KanalibCan.list_devices()`
+  and `KanaLin.list_devices()` report what is attached.
 
 ---
 
@@ -144,7 +179,7 @@ Everything below runs offline, against simulated firmware:
 
 ```bash
 py -m kanaliblin.selftest         &&  py KanalibLin/tests/test_offline.py
-py -m kanalibcan.selftest         &&  py KanalibCan/tests/test_offline.py
+py -m kanalibcan.selftest         &&  py KanalibCan/tests/test_offline.py   # 55 + 45
 ```
 
 The self-tests check the framing layers against known values (CRC check value,
@@ -161,10 +196,15 @@ runs do that.
 
 ## Status
 
-Version 1.0.0 for both packages. `KanalibLin` **replaces `LibKanaLin`**, which
-is obsolete: the package was renamed `kanalin` → `kanaliblin` and imports must
-be updated, but the API, the behaviour and the tests are the same validated
-code.
+Version 1.1.0 for both packages, adding board selection by USB serial to both,
+and to `KanalibCan` the data-phase diagnostics (`data_last_error`, `iso_mode`,
+`tdc_value`, `tx_dropped`) and overridable sample points. `KanalibLin`
+**replaces `LibKanaLin`**, which is obsolete: the package was renamed
+`kanalin` → `kanaliblin` and imports must be updated, but the API, the behaviour
+and the tests are the same validated code.
+
+Both are backward compatible: everything added is a new keyword argument, a new
+function, or a new key in the `diagnostics()` dictionary.
 
 Known boundaries are documented per library, and they are deliberate — see
 *Scope and limits* in [KanalibLin](KanalibLin/README.md#scope-and-limits) and

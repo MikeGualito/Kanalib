@@ -44,9 +44,13 @@ def main() -> int:
     ap.add_argument("--real", action="store_true")
     ap.add_argument("--count", type=int, default=50)
     ap.add_argument("--period", type=float, default=0.1)
+    ap.add_argument("--serial", default=None,
+                    help="USB serial of the board to use; with two "
+                         "attached, pick one (list_devices())")
     args = ap.parse_args()
 
-    bus = KanalibCan(bitrate=args.bitrate, loopback=not args.real).open()
+    bus = KanalibCan(bitrate=args.bitrate, loopback=not args.real,
+                     serial=args.serial).open()
     print(f"{'REAL BUS' if args.real else 'internal loopback'} at "
           f"{args.bitrate} bit/s, {args.count} PDUs every "
           f"{args.period * 1000:.0f} ms")

@@ -165,14 +165,22 @@ Runnable examples live in [`examples/`](examples):
 
 ### `KanaLin` — connection
 
-#### `KanaLin.open(port=None, **kwargs) -> KanaLin`
+#### `KanaLin.open(port=None, *, serial_number=None, **kwargs) -> KanaLin`
 
 Open a device. With `port=None` it finds the port by USB VID/PID.
 
 ```python
-lin = KanaLin.open()             # auto-detect
-lin = KanaLin.open("COM7")       # explicit
+lin = KanaLin.open()                            # auto-detect
+lin = KanaLin.open("COM7")                      # explicit port
+lin = KanaLin.open(serial_number="003200386528")  # explicit BOARD
 ```
+
+⚠️ **With more than one board attached, pass `serial_number`.** They share
+VID/PID, and a COM number is not an identity: Windows can reassign it between
+plug-ins, so the port that was your board last week may be the other one today.
+Each board derives its USB serial from its MCU unique device ID, which is the
+only thing that stays put. Without it, `open()` takes the first port found and
+logs which one it picked.
 
 Raises [`DeviceNotFound`](#exceptions) if nothing matches or the port cannot be
 opened. Keyword arguments are passed to the constructor:
@@ -183,10 +191,25 @@ opened. Keyword arguments are passed to the constructor:
 | `on_event` | `None` | callable invoked for every bus event (see [Threading model](#threading-model)) |
 | `event_queue_size` | `4096` | bus events buffered for `read_event()` |
 
-#### `KanaLin.find_ports(vid=0x0483, pid=0x5710) -> list[str]`
+#### `KanaLin.find_ports(vid=0x0483, pid=0x5710, serial_number=None) -> list[str]`
 
-Every port matching the KanaLin VID/PID. Useful when several devices are
-connected.
+Every port matching the KanaLin VID/PID, optionally narrowed to one board by its
+USB serial.
+
+#### `KanaLin.list_devices(vid=0x0483, pid=0x5710) -> list[tuple[str, str]]`
+
+`(port, serial_number)` for every attached board — use it to find out which
+serial to pass to `open()`.
+
+```python
+>>> KanaLin.list_devices()
+[('COM12', '003200386528'), ('COM14', '009600536528')]
+```
+
+> A board whose LIN transceiver is not fitted still enumerates, still reports a
+> serial, and still answers `ping()` and `loopback()` — it just never sees
+> anything on the bus. Do not read "the port is there" as "the LIN hardware is
+> there".
 
 #### `close()` / context manager
 

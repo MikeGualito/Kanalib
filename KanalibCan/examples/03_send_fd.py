@@ -40,12 +40,15 @@ def main() -> int:
     ap.add_argument("--real", action="store_true")
     ap.add_argument("--no-brs", action="store_true",
                     help="send FD frames without the bit rate switch")
+    ap.add_argument("--serial", default=None,
+                    help="USB serial of the board to use; with two "
+                         "attached, pick one (list_devices())")
     args = ap.parse_args()
 
     brs = not args.no_brs
     bus = KanalibCan(bitrate=args.bitrate, fd=True,
                      data_bitrate=args.data_bitrate,
-                     loopback=not args.real).open()
+                     loopback=not args.real, serial=args.serial).open()
     try:
         print(bus.describe())
         print("-" * 74)

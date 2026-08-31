@@ -55,7 +55,7 @@ from .timestamps import (
 
 # Version history starts here, at the split into KanalibLin / KanalibCan.
 # (The predecessor, LibKanaLin, reached 1.2.0; that numbering is not continued.)
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     # device

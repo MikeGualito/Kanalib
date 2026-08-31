@@ -26,10 +26,14 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bitrate", type=int, default=500_000)
     ap.add_argument("--data-bitrate", type=int, default=2_000_000)
+    ap.add_argument("--serial", default=None,
+                    help="USB serial of the board to use; with two "
+                         "attached, pick one (list_devices())")
     args = ap.parse_args()
 
     bus = KanalibCan(bitrate=args.bitrate, fd=True,
-                     data_bitrate=args.data_bitrate, loopback=True).open()
+                     data_bitrate=args.data_bitrate, loopback=True,
+                     serial=args.serial).open()
     try:
         print(bus.describe())
 
@@ -58,7 +62,14 @@ def main() -> int:
         print(f"  PE2 pin reads    {d['pe2_level']}  "
               "(read from the PIN, not from the variable)")
         print(f"  last_error       {d['last_error']}")
+        print(f"  data_last_error  {d['data_last_error']}  "
+              "(DATA phase of a BRS frame)")
         print(f"  tx_err / rx_err  {d['tx_err']} / {d['rx_err']}")
+        print(f"  iso_mode         {d['iso']}")
+        print(f"  tdc_value        {d['tdc_value']}  "
+              "(0 = transmitter delay compensation disabled)")
+        print(f"  tx_dropped       {d['tx_dropped']}  "
+              "(frames asked for that never reached the bus)")
         print("\n  NOTE on PE2: on the MCP2562FD, HIGH means the transceiver is"
               "\n  ASLEEP. That is the opposite of the LIN transceiver's SLP_N,"
               "\n  where high means awake. Confirmed by measurement: awake gives"

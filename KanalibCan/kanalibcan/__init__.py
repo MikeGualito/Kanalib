@@ -25,7 +25,7 @@ from .bittiming import (
     SAMPLE_POINT_DATA, SAMPLE_POINT_NOMINAL, TimingSolution,
     describe_supported, solve,
 )
-from .device import KanalibCan, find_devices
+from .device import KanalibCan, find_devices, list_devices
 from .errors import (
     BackendMissing, BitTimingError, ChannelStateError, DeviceBusy,
     DeviceNotFound, FrameError, KanalibCanError, TransferError,
@@ -41,12 +41,13 @@ from .protocol import (
     TEST_MODE_INTERNAL, TEST_MODE_MONITOR, TEST_MODE_NORMAL,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "KanalibCan",
     "CanMessage",
     "find_devices",
+    "list_devices",
     # bit timing
     "solve",
     "describe_supported",

@@ -175,6 +175,35 @@ NBTP/DBTP are writable only with the peripheral held in initialisation.
 `open()` therefore always sends `MODE(RESET)` first, so a previous run that died
 badly does not turn into a mystifying pipe error.
 
+### 8. A burst can outrun the bus, and `send()` will not tell you
+
+A 64-byte FD frame at 500 kbit/s nominal with a 2 Mbit/s data phase occupies
+about 250 us of wire. USB delivers faster than that, so a tight `for` loop of
+`send()` calls hands the device more than it can transmit. The device queues
+what it can (64 frames) and **counts the rest**; `send()` returns normally
+either way, because it has already handed the frame over.
+
+Check `diagnostics()["tx_dropped"]` after any burst. A non-zero value means
+frames you believe you sent do not exist as far as the other node is concerned
+-- which looks exactly like the other node ignoring you.
+
+Measured: a back-to-back burst of 100 frames goes out intact; 300 loses about
+15%, 600 about 27%, all of it counted. Spacing sends by 2 ms removes the loss
+entirely. Earlier firmware discarded them **silently**, with no counter at all,
+so a device reporting `tx_dropped = 0` on a large burst is old firmware rather
+than a clean run.
+
+### 9. `ERROR_PASSIVE` survives across runs
+
+The FDCAN error counters are not cleared by opening the device. A run where
+nobody acknowledged leaves the node at `tx_err = 128` and `ERROR_PASSIVE`, and
+`open()` does not reset it -- only 128 **successful** transmissions bring it
+back down, one per frame.
+
+If a session starts behaving oddly, check `get_state()` before anything else.
+And note the related trap: with no other node acknowledging, retransmission
+means **nothing** goes out at all, not merely some frames.
+
 ---
 
 ## API
@@ -192,7 +221,18 @@ badly does not turn into a mystifying pipe error.
 | `hw_timestamp` | `True` | MCU timestamps on every frame |
 | `receive_own_messages` | `True` | deliver echoes as well as received frames |
 | `rx_queue_size` | `8192` | host-side buffer; oldest are dropped when full |
-| `serial` | `None` | pick a specific board |
+| `serial` | `None` | pick a specific board by USB serial; required once two are attached |
+| `sample_point` | `None` | nominal sample point as a fraction; `None` uses 87.5% |
+| `data_sample_point` | `None` | data-phase sample point; `None` uses 83.33% |
+
+Two boards share VID/PID and their COM numbers move between plug-ins, so
+`serial` is the only stable way to choose one. Each board derives its serial
+from its MCU unique device ID; `list_devices()` reports what is attached.
+
+The sample points exist so two nodes can be **deliberately detuned** against
+each other. The data-phase default of 83.33% is outside the 70-80% that
+CiA 601-3 suggests, and an ECU is likely to use 75% or 80%; overriding it is how
+you find out whether that matters on your bus rather than guessing.
 
 Methods: `open()`, `close()`, `send(msg, timeout)`, `recv(timeout)`,
 `iter_messages(timeout)`, `flush()`, `get_state()`, `state_name()`,
@@ -200,6 +240,22 @@ Methods: `open()`, `close()`, `send(msg, timeout)`, `recv(timeout)`,
 `read_bit_timing_registers()`, `diagnostics()`, `set_test_mode()`,
 `set_standby()`. Properties: `pending`, `dropped`, `nominal_timing`,
 `data_timing`, `fclk_hz`, `bt_const`, `bt_const_ext`, `device_config`.
+
+Module level: `find_devices()` returns the raw pyusb devices, and
+`list_devices()` returns the USB serial of each attached board -- the value to
+pass as `serial`.
+
+#### What `diagnostics()` returns
+
+| Key | Meaning |
+|---|---|
+| `test_mode`, `stby_drive`, `pe2_level` | the KanaLin test controls; `pe2_level` is read from the pin, not from the variable |
+| `last_error`, `last_error_code` | protocol error code. Reading **clears** it, so read once to clear, act, then read again |
+| `data_last_error`, `data_last_error_code` | the same, for the **data phase** of a BRS frame. This is the one that moves when a frame fails after the bit rate switch, and the only way to tell that from a failure while arbitrating |
+| `tx_err`, `rx_err` | FDCAN error counters |
+| `tx_dropped` | frames handed over that never reached the bus (gotcha 8). Cumulative, not cleared by reading |
+| `iso_mode`, `iso` | 1 for ISO 11898-1:2015 CRC, 0 for the original Bosch CAN FD. Two nodes that disagree trade classic frames perfectly and fail **every** FD frame |
+| `tdc_value` | transmitter delay measured through the real transceiver, in data-phase quanta. 0 while the firmware leaves TDC disabled |
 
 Use it as a context manager; `close()` stops the channel and releases the
 handle, which matters because of the one-handle rule.
@@ -243,13 +299,22 @@ for s in describe_supported():
 All default to internal loopback except `05_real_bus.py`, so they run with
 nothing attached to CAN_H/CAN_L.
 
+**With two boards attached, say which one**: `01`-`05` take `--serial`, and
+`00_preflight.py` takes it as a positional argument (and reports every board it
+can see, so run it first to learn the serials).
+
+```
+py examples/00_preflight.py 003200386528
+py examples/01_monitor.py --serial 003200386528 --real
+```
+
 ---
 
 ## Testing
 
 ```
 python -m kanalibcan.selftest      # 55 checks, no hardware
-python tests/test_offline.py       # 41 checks against a SIMULATED device
+python tests/test_offline.py       # 45 checks against a SIMULATED device
 python examples/00_preflight.py    # needs the board
 ```
 
@@ -272,6 +337,12 @@ echo/rx split, FD, diagnostics, close — against a fake device.
   CAN, and reimplementing it would be a worse version of a solved problem.
 - **No automatic reconnection.** After the device disappears, build a new
   instance.
+- **A sustained burst still loses frames**, because the host can outrun the bus
+  indefinitely and no queue fixes that. What the library guarantees is that the
+  loss is *visible*: see `tx_dropped` in gotcha 8.
+- **Bit timing is per bus, not per node.** `sample_point`/`data_sample_point`
+  let you detune one node deliberately; they are a diagnostic tool, not
+  something to leave set in production code.
 - **Termination is a manual jumper** (JP9 on the board), not software.
 - **`IDENTIFY`, `USER_ID`, `TERMINATION` and `BERR_REPORTING` are not
   advertised by the firmware** and are therefore not exposed.

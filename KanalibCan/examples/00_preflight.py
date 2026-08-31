@@ -20,7 +20,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from kanalibcan import (  # noqa: E402
     BackendMissing, CanMessage, DeviceBusy, DeviceNotFound, KanalibCan,
-    find_devices, solve,
+    find_devices, list_devices, solve,
 )
 from kanalibcan.protocol import EXPECTED_FCLK_HZ  # noqa: E402
 
@@ -71,10 +71,24 @@ def main() -> int:
              "LIN channel) showing up as a COM port does NOT prove it.")
         return 1
 
+    # Which board this preflight actually tested matters as soon as there is
+    # more than one: they share VID/PID, so without saying so the result is
+    # about whichever one libusb happened to return first.
+    serial = sys.argv[1] if len(sys.argv) > 1 else None
+    serials = list_devices()
+    if len(devices) > 1:
+        note(f"{len(devices)} boards attached: "
+             + ", ".join(s or "?" for s in serials))
+        if serial is None:
+            note("testing the first one; pass a serial as the argument to "
+                 "choose, e.g. py 00_preflight.py " + (serials[0] or "<serial>"))
+    elif serials:
+        note(f"board serial {serials[0] or '<unreadable>'}")
+
     print("\n== 3. open the channel ==")
     try:
         bus = KanalibCan(bitrate=500_000, fd=True, data_bitrate=2_000_000,
-                         loopback=True).open()
+                         loopback=True, serial=serial).open()
     except DeviceBusy as exc:
         check("the CAN interface can be claimed", False, str(exc))
         return 1

@@ -166,28 +166,53 @@ class KanaLin:
     # Discovery / lifecycle
     # ------------------------------------------------------------------
     @staticmethod
-    def find_ports(vid: int = USB_VID, pid: int = USB_PID) -> list[str]:
-        """Return every serial port matching the KanaLin VID/PID, in system order."""
+    def find_ports(vid: int = USB_VID, pid: int = USB_PID,
+                   serial_number: str | None = None) -> list[str]:
+        """Return every serial port matching the KanaLin VID/PID, in system order.
+
+        :param serial_number: keep only the board with this USB serial. Every
+            board reports one derived from its MCU's unique device ID, which is
+            the only thing that tells two KanaLin boards apart -- VID/PID and
+            the COM port number do not (the latter can change between plug-ins).
+            Use :meth:`list_devices` to see which serials are attached.
+        """
         if list_ports is None:  # pragma: no cover
             raise KanaLinError("pyserial is required to enumerate ports: pip install pyserial")
-        return [p.device for p in list_ports.comports() if p.vid == vid and p.pid == pid]
+        return [p.device for p in list_ports.comports()
+                if p.vid == vid and p.pid == pid
+                and (serial_number is None or p.serial_number == serial_number)]
+
+    @staticmethod
+    def list_devices(vid: int = USB_VID, pid: int = USB_PID) -> list[tuple[str, str]]:
+        """Return ``(port, serial_number)`` for every KanaLin board attached."""
+        if list_ports is None:  # pragma: no cover
+            raise KanaLinError("pyserial is required to enumerate ports: pip install pyserial")
+        return [(p.device, p.serial_number or "")
+                for p in list_ports.comports() if p.vid == vid and p.pid == pid]
 
     @classmethod
-    def open(cls, port: str | None = None, **kwargs) -> "KanaLin":
+    def open(cls, port: str | None = None, *, serial_number: str | None = None,
+             **kwargs) -> "KanaLin":
         """
         Open a device, auto-detecting the port when it is not given.
 
+        :param serial_number: pick the board with this USB serial instead of the
+            first one found. Required to be deterministic once more than one
+            board is plugged in.
         :raises DeviceNotFound: nothing matching the KanaLin VID/PID is present.
         """
         if port is None:
-            ports = cls.find_ports()
+            ports = cls.find_ports(serial_number=serial_number)
             if not ports:
+                extra = (f" with serial {serial_number!r}"
+                         if serial_number is not None else "")
                 raise DeviceNotFound(
-                    f"no KanaLin device found (looking for VID 0x{USB_VID:04X} "
+                    f"no KanaLin device found{extra} (looking for VID 0x{USB_VID:04X} "
                     f"PID 0x{USB_PID:04X}); is it plugged in and enumerated?"
                 )
             if len(ports) > 1:
-                log.info("several KanaLin devices found (%s), using %s", ports, ports[0])
+                log.info("several KanaLin devices found (%s), using %s; "
+                         "pass serial_number= to choose", ports, ports[0])
             port = ports[0]
         try:
             return cls(port, **kwargs)

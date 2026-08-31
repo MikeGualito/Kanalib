@@ -112,9 +112,12 @@ class FakeDevice:
                 n[4], n[3], n[0] + n[1], n[2],
                 d[4], d[3], d[0] + d[1], d[2]))
         if req == P.BREQ_KANALIN_DIAG:
-            return array_of(struct.pack("<6I", self.test_mode, self.stby,
+            # 10 u32: the 6 original ones plus data_last_error_code,
+            # tdc_value, iso_mode and tx_dropped. iso_mode 1 = ISO, which is
+            # what the firmware leaves the peripheral in.
+            return array_of(struct.pack("<10I", self.test_mode, self.stby,
                                         0 if self.stby == P.STBY_AWAKE else 1,
-                                        0, 0, 0))
+                                        0, 0, 0, 0, 0, 1, 0))
         raise usb.core.USBError("stalled")
 
     def _bt_const(self):
@@ -286,6 +289,10 @@ def main() -> int:
        regs["nominal"]["bitrate"], 500_000)
     diag = bus.diagnostics()
     eq("diag decodes last_error", diag["last_error"], "NONE")
+    eq("diag decodes the DATA-phase error", diag["data_last_error"], "NONE")
+    eq("diag reports the ISO CRC", diag["iso"], "ISO 11898-1:2015")
+    eq("diag reports tdc_value", diag["tdc_value"], 0)
+    eq("diag reports tx_dropped", diag["tx_dropped"], 0)
     bus.set_standby(P.STBY_ASLEEP)
     eq("standby is driven", bus.diagnostics()["pe2_level"], 1)
     bus.set_standby(P.STBY_AWAKE)

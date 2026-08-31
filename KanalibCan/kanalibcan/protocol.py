@@ -87,7 +87,7 @@ BREQ_KANALIN_STBY = 0x42            # drive PE2 (transceiver standby) by hand
 BREQ_KANALIN_DIAG = 0x43            # test mode, PE2 level, last error, counters
 BREQ_KANALIN_BT_REGS = 0x44         # bit timing READ BACK from NBTP/DBTP
 
-DIAG_LEN = 24                       # 6 u32
+DIAG_LEN = 40                       # 10 u32
 BT_REGS_LEN = 36                    # 9 u32
 
 # --- gs_device_mode.mode ----------------------------------------------------
@@ -206,9 +206,17 @@ TEST_MODE_MONITOR = 4     # bus monitoring (listen only)
 STBY_AWAKE = 0
 STBY_ASLEEP = 1
 
-# last_error_code values reported by BREQ_KANALIN_DIAG.
+# last_error_code values reported by BREQ_KANALIN_DIAG. The same table decodes
+# data_last_error_code, which is the identical field for the data phase of a
+# BRS frame -- the only one that moves when a frame fails after the bit rate
+# switch rather than while arbitrating.
 LEC_NAMES = {0: "NONE", 1: "STUFF", 2: "FORM", 3: "ACK", 4: "BIT1",
              5: "BIT0", 6: "CRC", 7: "NO_CHANGE"}
+
+# iso_mode as reported by BREQ_KANALIN_DIAG. Two nodes that disagree here trade
+# classic frames perfectly and fail EVERY FD frame, so it is read back from the
+# peripheral rather than assumed.
+ISO_NAMES = {0: "NON_ISO (Bosch CAN FD)", 1: "ISO 11898-1:2015"}
 
 
 def feature_names(mask: int) -> list:

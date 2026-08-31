@@ -41,6 +41,9 @@ def main() -> int:
                     help="inject traffic so there is something to watch")
     ap.add_argument("--seconds", type=float, default=5.0,
                     help="0 means until Ctrl-C")
+    ap.add_argument("--serial", default=None,
+                    help="USB serial of the board to use; with two "
+                         "attached, pick one (list_devices())")
     args = ap.parse_args()
 
     if args.listen_only and not args.real:
@@ -51,7 +54,8 @@ def main() -> int:
     bus = KanalibCan(bitrate=args.bitrate, fd=args.fd,
                      data_bitrate=args.data_bitrate if args.fd else None,
                      loopback=not args.real,
-                     listen_only=args.listen_only).open()
+                     listen_only=args.listen_only,
+                     serial=args.serial).open()
     where = "REAL BUS" if args.real else "internal loopback (nothing on CAN_H/L)"
     print(f"listening on {where} at {args.bitrate} bit/s"
           + ("  [listen-only]" if args.listen_only else ""))

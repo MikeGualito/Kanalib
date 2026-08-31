@@ -41,8 +41,9 @@ from .protocol import (
     GS_USB_BREQ_BT_CONST, GS_USB_BREQ_BT_CONST_EXT,
     GS_USB_BREQ_DATA_BITTIMING, GS_USB_BREQ_DEVICE_CONFIG,
     GS_USB_BREQ_GET_STATE, GS_USB_BREQ_HOST_FORMAT, GS_USB_BREQ_MODE,
-    GS_USB_BREQ_TIMESTAMP, KANALIN_PID, KANALIN_VID, LEC_NAMES, STATE_NAMES,
-    STBY_AWAKE, TEST_MODE_DEFAULT, VENDOR_INTERFACE, feature_names,
+    GS_USB_BREQ_TIMESTAMP, ISO_NAMES, KANALIN_PID, KANALIN_VID, LEC_NAMES,
+    STATE_NAMES, STBY_AWAKE, TEST_MODE_DEFAULT, VENDOR_INTERFACE,
+    feature_names,
 )
 
 # Bulk reads MUST be a multiple of the 64-byte wMaxPacketSize: WinUSB rejects
@@ -79,6 +80,24 @@ def find_devices() -> list:
                               idProduct=KANALIN_PID, backend=_backend()))
 
 
+def _serial_of(dev) -> str:
+    """The device's USB serial, or "" when it cannot be read right now."""
+    try:
+        return dev.serial_number or ""
+    except (usb.core.USBError, NotImplementedError, ValueError):
+        return ""
+
+
+def list_devices() -> list:
+    """Return the USB serial number of every KanaLin board attached.
+
+    Each board derives its serial from the MCU's unique device ID, so this is
+    what tells two of them apart: VID/PID are identical and the enumeration
+    order is not stable. Pass the one you want as `KanalibCan(serial=...)`.
+    """
+    return [_serial_of(dev) for dev in find_devices()]
+
+
 class KanalibCan:
     """The CAN / CAN FD channel of a KanaLin interface.
 
@@ -105,7 +124,9 @@ class KanalibCan:
                  hw_timestamp: bool = True,
                  receive_own_messages: bool = True,
                  rx_queue_size: int = 8192,
-                 serial: Optional[str] = None) -> None:
+                 serial: Optional[str] = None,
+                 sample_point: Optional[float] = None,
+                 data_sample_point: Optional[float] = None) -> None:
         if listen_only and loopback:
             raise ValueError("listen_only and loopback are mutually exclusive")
         if fd and data_bitrate is None:
@@ -115,6 +136,14 @@ class KanalibCan:
 
         self.bitrate = bitrate
         self.data_bitrate = data_bitrate
+        # Sample points, as a fraction of the bit. The defaults live in
+        # bittiming.py (87.5% nominal, 83.33% data) and are the ones the scope
+        # measurements were taken with. They are overridable because the data
+        # phase is where two FD nodes have to agree and where there is no way
+        # to ask the other end what it uses: 75% and 80% are the common
+        # automotive choices, and 75% is what this board itself boots with.
+        self.sample_point = sample_point
+        self.data_sample_point = data_sample_point
         self.fd = fd
         self.loopback = loopback
         self.listen_only = listen_only
@@ -152,10 +181,22 @@ class KanalibCan:
                 f"no KanaLin device ({KANALIN_VID:04x}:{KANALIN_PID:04x}). "
                 "Is it plugged in, and did WinUSB bind to interface 2?")
         if self._serial is not None:
-            devices = [d for d in devices
-                       if (d.serial_number or "") == self._serial]
+            # Reading the serial is a live control transfer, and it throws for a
+            # device whose vendor interface Windows has not finished binding to
+            # WinUSB -- which happens for seconds after a board with a new
+            # serial is first plugged in. Skip such a device instead of letting
+            # the exception escape: a board that cannot be identified is not the
+            # one that was asked for, and crashing here hides the boards that
+            # ARE ready.
+            attached = [(d, _serial_of(d)) for d in devices]
+            devices = [d for d, s in attached if s == self._serial]
             if not devices:
-                raise DeviceNotFound(f"no KanaLin with serial {self._serial!r}")
+                seen = ", ".join(repr(s) if s else "<unreadable>"
+                                 for _, s in attached) or "none"
+                raise DeviceNotFound(
+                    f"no KanaLin with serial {self._serial!r}; attached: {seen}. "
+                    "An <unreadable> entry usually means Windows is still "
+                    "binding that device to WinUSB -- retry in a few seconds.")
         dev = devices[0]
 
         try:
@@ -200,12 +241,14 @@ class KanalibCan:
 
     def _program_timing(self) -> None:
         self.nominal_timing = solve(self.bitrate, self.fclk_hz,
-                                    data_phase=False)
+                                    data_phase=False,
+                                    sample_point=self.sample_point)
         self._ctrl_out(GS_USB_BREQ_BITTIMING,
                        self.nominal_timing.bittiming.serialize())
         if self.fd:
             self.data_timing = solve(self.data_bitrate, self.fclk_hz,
-                                     data_phase=True)
+                                     data_phase=True,
+                                     sample_point=self.data_sample_point)
             self._ctrl_out(GS_USB_BREQ_DATA_BITTIMING,
                            self.data_timing.bittiming.serialize())
 
@@ -415,9 +458,25 @@ class KanalibCan:
         }
 
     def diagnostics(self) -> dict:
-        """KanaLin diagnostic block: test mode, PE2, last error, counters."""
+        """KanaLin diagnostic block: test mode, PE2, errors, FD status.
+
+        `data_last_error` is the one to read when an FD frame fails: it is the
+        error code for the DATA phase of a BRS frame, so it separates "the
+        frame died while arbitrating at the nominal rate" from "it died after
+        the bit rate switched", which have entirely different causes.
+
+        `iso_mode` and `tdc_value` describe the two FD settings a loopback test
+        can never disagree about, because both ends of a loopback share them.
+
+        `tx_dropped` counts frames this device was asked to send that never
+        reached the bus, because the host sustained more than the bus could
+        carry. Check it after any burst: a non-zero value means `send()`
+        returned normally for frames that do not exist as far as the other
+        node is concerned.
+        """
         raw = self._ctrl_in(BREQ_KANALIN_DIAG, DIAG_LEN)
-        v = [int.from_bytes(raw[i:i + 4], "little") for i in range(0, 24, 4)]
+        v = [int.from_bytes(raw[i:i + 4], "little")
+             for i in range(0, DIAG_LEN, 4)]
         return {
             "test_mode": v[0],
             "stby_drive": v[1],
@@ -426,6 +485,12 @@ class KanalibCan:
             "last_error": LEC_NAMES.get(v[3], "?"),
             "tx_err": v[4],
             "rx_err": v[5],
+            "data_last_error_code": v[6],
+            "data_last_error": LEC_NAMES.get(v[6], "?"),
+            "tdc_value": v[7],          # 0 while TDC stays disabled
+            "iso_mode": v[8],
+            "iso": ISO_NAMES.get(v[8], "?"),
+            "tx_dropped": v[9],
         }
 
     def set_test_mode(self, mode: int = TEST_MODE_DEFAULT) -> None:

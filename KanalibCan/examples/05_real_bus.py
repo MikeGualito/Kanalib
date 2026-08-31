@@ -42,10 +42,13 @@ def main() -> int:
     ap.add_argument("--count", type=int, default=10)
     ap.add_argument("--listen-only", action="store_true")
     ap.add_argument("--seconds", type=float, default=3.0)
+    ap.add_argument("--serial", default=None,
+                    help="USB serial of the board to use; with two "
+                         "attached, pick one (list_devices())")
     args = ap.parse_args()
 
     bus = KanalibCan(bitrate=args.bitrate, loopback=False,
-                     listen_only=args.listen_only).open()
+                     listen_only=args.listen_only, serial=args.serial).open()
     try:
         print(bus.describe())
         print("-" * 66)

@@ -30,15 +30,19 @@ Kanalib/
 │   ├── examples/        6 runnable examples
 │   ├── tests/           offline test suite (simulated firmware)
 │   └── README.md        full API reference
-└── KanalibCan/          CAN / CAN FD channel
-    ├── kanalibcan/      package (device, framing, protocol, bittiming, message)
-    ├── examples/        6 runnable examples
-    ├── tests/           offline test suite (simulated device)
-    └── README.md        full API reference
+├── KanalibCan/          CAN / CAN FD channel
+│   ├── kanalibcan/      package (device, framing, protocol, bittiming, message)
+│   ├── examples/        6 runnable examples
+│   ├── tests/           offline test suite (simulated device)
+│   └── README.md        full API reference
+└── Firmware/            the device image, and a script to flash it
 ```
 
-Each folder is a standalone installable project with its own `pyproject.toml`.
-Install only the channel you need.
+Each library folder is a standalone installable project with its own
+`pyproject.toml`. Install only the channel you need.
+
+Both libraries need a board already running the image in
+[`Firmware/`](Firmware/README.md); without it there is nothing to open.
 
 ---
 

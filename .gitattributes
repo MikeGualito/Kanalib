@@ -1,0 +1,6 @@
+# The firmware image is a build artefact: git must hand it back byte for byte,
+# or the sha256 published beside it stops matching on checkout. Intel HEX is a
+# text format, so without this rule core.autocrlf rewrites its line endings.
+Firmware/*.hex -text
+Firmware/*.bin binary
+Firmware/*.elf binary

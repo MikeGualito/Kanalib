@@ -124,6 +124,7 @@ class KanalibCan:
                  hw_timestamp: bool = True,
                  receive_own_messages: bool = True,
                  rx_queue_size: int = 8192,
+                 max_tx_in_flight: Optional[int] = 48,
                  serial: Optional[str] = None,
                  sample_point: Optional[float] = None,
                  data_sample_point: Optional[float] = None) -> None:
@@ -160,6 +161,18 @@ class KanalibCan:
         self._stop = threading.Event()
         self._echo_counter = 0
         self._dropped = 0
+
+        # Host-side flow control. The device keeps 64 frames queued for the
+        # bus and DISCARDS (counting them in diagnostics()["tx_dropped"]) any
+        # it is handed beyond that, while send() has already returned. The
+        # echo of each frame is what says it left the queue, so send() waits
+        # whenever this many frames are still unconfirmed. None disables it.
+        if max_tx_in_flight is not None and not 1 <= max_tx_in_flight <= 63:
+            raise ValueError("max_tx_in_flight must be 1..63 (the device "
+                             "queue holds 64) or None to disable")
+        self.max_tx_in_flight = max_tx_in_flight
+        self._tx_cond = threading.Condition()
+        self._tx_in_flight = 0
 
         # Filled in by open()
         self.device_config: Optional[DeviceConfig] = None
@@ -269,6 +282,8 @@ class KanalibCan:
 
     def _start_channel(self) -> None:
         self._set_mode(GS_CAN_MODE_START, self.mode_flags)
+        with self._tx_cond:
+            self._tx_in_flight = 0
         self._started = True
         self._stop.clear()
         self._reader = threading.Thread(target=self._read_loop,
@@ -337,6 +352,11 @@ class KanalibCan:
             if code != GS_OK or hf is None:
                 continue
             msg = CanMessage.from_host_frame(hf)
+            if not msg.is_rx:
+                with self._tx_cond:
+                    if self._tx_in_flight > 0:
+                        self._tx_in_flight -= 1
+                    self._tx_cond.notify_all()
             if not self.receive_own_messages and not msg.is_rx:
                 continue
             try:
@@ -365,6 +385,15 @@ class KanalibCan:
 
         ⚠️ The echo carries NO payload: the Tx Event FIFO stores the header,
         not the data. See CanMessage.is_echo.
+
+        FLOW CONTROL: the device queues at most 64 frames for the bus and
+        silently discards the rest, so this waits (up to `timeout`) while
+        `max_tx_in_flight` frames are still unconfirmed, and raises
+        TransferError if the bus does not drain in that time -- a dead bus or
+        no other node to ACK looks exactly like that. Only frames the bus
+        actually carries are confirmed, so a one_shot frame that loses
+        arbitration is never echoed and its slot stays taken until the wait
+        times out and the count is reset.
         """
         if not self._started:
             raise ChannelStateError("channel is not started")
@@ -376,9 +405,33 @@ class KanalibCan:
         self._echo_counter = (self._echo_counter + 1) & 0x7FFFFFFF
         echo_id = self._echo_counter
         wire = msg.to_host_frame(echo_id).serialize(hw_timestamp=False)
+
+        limit = self.max_tx_in_flight
+        if limit is not None:
+            # Claim the slot BEFORE writing: the echo can come back before the
+            # write call returns, and counting afterwards would let it go
+            # negative.
+            deadline = time.monotonic() + timeout
+            with self._tx_cond:
+                while self._tx_in_flight >= limit:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        stuck = self._tx_in_flight
+                        self._tx_in_flight = 0
+                        raise TransferError(
+                            f"{stuck} frames were never confirmed on the bus "
+                            f"within {timeout} s (no other node to ACK, or "
+                            "the bus is down); the count was reset")
+                    self._tx_cond.wait(left)
+                self._tx_in_flight += 1
         try:
             self._dev.write(EP_OUT, wire, int(timeout * 1000))
         except usb.core.USBError as exc:
+            if limit is not None:
+                with self._tx_cond:
+                    if self._tx_in_flight > 0:
+                        self._tx_in_flight -= 1
+                    self._tx_cond.notify_all()
             raise TransferError(f"bulk write failed: {exc}") from exc
         return echo_id
 

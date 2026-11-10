@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import struct
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -29,6 +30,7 @@ import usb.util   # noqa: E402
 from kanalibcan import (  # noqa: E402
     CanMessage, ChannelStateError, DeviceNotFound, KanalibCan,
 )
+from kanalibcan.errors import TransferError  # noqa: E402
 from kanalibcan import device as devmod  # noqa: E402
 from kanalibcan import protocol as P     # noqa: E402
 from kanalibcan.framing import (  # noqa: E402
@@ -193,6 +195,71 @@ def array_of(b: bytes):
     return array.array("B", b)
 
 
+class SlowBusDevice(FakeDevice):
+    """A FakeDevice whose bus is slower than the host, like the real one.
+
+    The firmware holds 64 frames for the bus and DISCARDS any it is handed once
+    that queue is full, counting them in diagnostics()["tx_dropped"]. Echoes
+    come back only when a frame leaves the queue, which here is a background
+    thread moving one frame per `bus_period` seconds (None = a dead bus that
+    never drains).
+    """
+
+    QUEUE = 64
+
+    def __init__(self, bus_period=0.001):
+        super().__init__()
+        self.bus_period = bus_period
+        self.txq = []
+        self.dropped = 0
+        self.peak = 0
+        self.sent_on_bus = 0
+        self.fail_next_write = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._bus, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+    def _bus(self):
+        while not self._stop.is_set():
+            time.sleep(self.bus_period or 0.01)
+            if self.bus_period is None or not self.txq:
+                continue
+            hf = self.txq.pop(0)
+            self.sent_on_bus += 1
+            ts = bool(self.mode_flags & P.GS_CAN_MODE_HW_TIMESTAMP)
+            self.clock += 100
+            hf.timestamp_us = self.clock
+            self.pending.append(hf.serialize(ts))        # the echo
+
+    def write(self, ep, data, timeout=None):
+        if self.fail_next_write:
+            self.fail_next_write = False
+            raise usb.core.USBError("write failed")
+        if ep != P.EP_OUT:
+            raise usb.core.USBError("wrong endpoint")
+        if not self.started:
+            return len(data)
+        code, hf = parse_frame(bytes(data), hw_timestamp=False)
+        if code != P.GS_OK:
+            return len(data)
+        if len(self.txq) >= self.QUEUE:
+            self.dropped += 1                  # the silent loss being guarded
+            return len(data)
+        self.txq.append(hf)
+        self.peak = max(self.peak, len(self.txq))
+        return len(data)
+
+    def _ctrl_in(self, req, length):
+        if req == P.BREQ_KANALIN_DIAG:
+            return array_of(struct.pack("<10I", self.test_mode, self.stby, 0,
+                                        0, 0, 0, 0, 0, 1, self.dropped))
+        return super()._ctrl_in(req, length)
+
+
 def install_fake(dev):
     devmod.find_devices = lambda: [dev]
     usb.util.claim_interface = lambda d, i: None
@@ -319,6 +386,97 @@ def main() -> int:
        not fake.rejected_timing_while_started)
     eq("the new rate really was programmed", fake.nominal[4], 8)   # brp
     bus.close()
+
+    print("== TX flow control: a host faster than the bus ==")
+    FRAME = CanMessage(0x100, b"12345678")
+
+    def count_echoes(b, want, wait=3.0):
+        got, end = 0, time.time() + wait
+        while got < want and time.time() < end:
+            m = b.recv(timeout=0.1)
+            got += bool(m is not None and not m.is_rx)
+        return got
+
+    slow = SlowBusDevice(bus_period=0.002)
+    install_fake(slow)
+
+    bus = KanalibCan(bitrate=500_000, max_tx_in_flight=None).open()
+    for _ in range(150):
+        bus.send(FRAME)
+    time.sleep(0.2)
+    ok("the model reproduces the loss: disabled, 150 sent overflow the queue",
+       slow.dropped > 0, f"(dropped {slow.dropped})")
+    eq("...and the device counter says so",
+       bus.diagnostics()["tx_dropped"], slow.dropped)
+    bus.close()
+
+    slow.txq.clear(); slow.pending.clear()
+    slow.dropped = slow.peak = slow.sent_on_bus = 0
+    bus = KanalibCan(bitrate=500_000).open()
+    eq("the default is 48 frames in flight", bus.max_tx_in_flight, 48)
+    for _ in range(200):
+        bus.send(FRAME)
+    eq("enabled: all 200 reach the bus", count_echoes(bus, 200), 200)
+    eq("enabled: nothing was dropped", slow.dropped, 0)
+    eq("enabled: tx_dropped reads 0", bus.diagnostics()["tx_dropped"], 0)
+    ok("enabled: the device queue never exceeded the limit",
+       slow.peak <= 48, f"(peak {slow.peak})")
+    eq("every confirmation was counted back", bus._tx_in_flight, 0)
+    bus.close()
+
+    print("== TX flow control: a bus that never drains ==")
+    dead = SlowBusDevice(bus_period=None)
+    install_fake(dead)
+    bus = KanalibCan(bitrate=500_000, max_tx_in_flight=10).open()
+    sent = 0
+    t0 = time.time()
+    try:
+        for _ in range(50):
+            bus.send(FRAME, timeout=0.3)
+            sent += 1
+        ok("send() raises when nothing is ever confirmed", False)
+    except TransferError as exc:
+        ok("send() raises when nothing is ever confirmed", True)
+        ok("the message names the cause", "never confirmed" in str(exc))
+    eq("it let exactly the limit through first", sent, 10)
+    ok("it waited for the timeout, not forever", 0.25 < time.time() - t0 < 2.0,
+       f"({time.time() - t0:.2f} s)")
+    eq("the device received exactly those, none dropped",
+       (len(dead.txq), dead.dropped), (10, 0))
+    eq("the stuck count was reset after the error", bus._tx_in_flight, 0)
+    bus.send(FRAME, timeout=0.3)
+    ok("the channel is usable again after the error", True)
+    bus.close()
+    dead.stop()
+
+    print("== TX flow control: failure paths ==")
+    install_fake(slow)
+    slow.txq.clear(); slow.pending.clear()
+    bus = KanalibCan(bitrate=500_000, max_tx_in_flight=5).open()
+    slow.fail_next_write = True
+    try:
+        bus.send(FRAME)
+        ok("a failed bulk write raises TransferError", False)
+    except TransferError:
+        ok("a failed bulk write raises TransferError", True)
+    eq("a failed write gives its slot back", bus._tx_in_flight, 0)
+    bus.close()
+    bus = KanalibCan(bitrate=500_000, max_tx_in_flight=5).open()
+    bus._tx_in_flight = 3                 # as a previous session could leave it
+    bus.close()
+    bus.open()
+    eq("reopening the channel starts the count from zero",
+       bus._tx_in_flight, 0)
+    bus.close()
+    for bad in (0, 64, -1):
+        try:
+            KanalibCan(max_tx_in_flight=bad)
+            ok(f"max_tx_in_flight={bad} is refused", False)
+        except ValueError:
+            ok(f"max_tx_in_flight={bad} is refused", True)
+    ok("None disables it", KanalibCan(max_tx_in_flight=None)
+       .max_tx_in_flight is None)
+    slow.stop()
 
     print("== no device ==")
     devmod.find_devices = lambda: []
